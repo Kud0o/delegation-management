@@ -42,6 +42,10 @@ Mailbox states:
 
 The mailbox stays as an audit snapshot until the next message overwrites it.
 
+## History file
+
+`history.jsonl` in the bus directory is an append-only diagnostic trail: one JSON record per line, `{"event": "sent", "at": ..., "message": {...}}` on delivery and `{"event": "consumed", "at": ..., "role", "message_id", "task_id", "type"}` on consumption. It survives mailbox overwrites and resets. It is not part of delivery semantics: history append failures never fail a send, torn lines are skipped on read, and agents must not treat it as an inbox. Inspect with the `history` command.
+
 ## PID record
 
 ```json
@@ -112,6 +116,8 @@ Omitted `--timeout` uses role defaults: 600 seconds for `delegatee`, 300 seconds
 | 5 | `wait`: woke without a pending message (spurious wake) |
 | 6 | `await-reply`: terminal message did not match `--expect` (already consumed) |
 | 7 | `takeover`: refused because a same-task reply is already pending |
+
+`selftest` exits 0 when every end-to-end check passes, 1 otherwise.
 
 ## Why the listener is disposable
 

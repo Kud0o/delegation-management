@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -74,6 +75,23 @@ def message_path(bus_dir: Path, role: str) -> Path:
 
 def pid_path(bus_dir: Path, role: str) -> Path:
     return bus_dir / f"{role}.pid"
+
+
+def history_path(bus_dir: Path) -> Path:
+    return bus_dir / "history.jsonl"
+
+
+def append_history(bus_dir: Path, event: str, payload: Dict[str, Any]) -> None:
+    """Append one audit record. History is diagnostic: never fail delivery over it."""
+    record: Dict[str, Any] = {"event": event, "at": utc_now()}
+    record.update(payload)
+    try:
+        with history_path(bus_dir).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
 
 
 def empty_mailbox(role: str) -> Dict[str, Any]:
@@ -375,8 +393,24 @@ def deliver(
         "updated_at": utc_now(),
     }
     atomic_write_json(path, envelope)
+    append_history(bus_dir, "sent", {"message": message})
     notification = notify_listener(bus_dir, recipient)
     return {"ok": True, "message": message, "notification": notification}
+
+
+def resolve_body(args: argparse.Namespace) -> str:
+    if getattr(args, "body_file", None):
+        if args.body is not None:
+            raise SystemExit("Use either --body or --body-file, not both")
+        if args.body_file == "-":
+            return sys.stdin.read()
+        try:
+            return Path(args.body_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"Cannot read --body-file: {exc}")
+    if args.body is None:
+        raise SystemExit("Provide --body or --body-file (use --body-file - for stdin)")
+    return args.body
 
 
 def cmd_send(args: argparse.Namespace) -> int:
@@ -392,7 +426,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         recipient=recipient,
         msg_type=args.type,
         subject=args.subject,
-        body=args.body,
+        body=resolve_body(args),
         task_id=args.task_id,
         reply_to=args.reply_to,
         metadata=parse_metadata(args.metadata),
@@ -410,6 +444,17 @@ def consume_mailbox(bus_dir: Path, role: str, *, mark_consumed: bool) -> Dict[st
         mailbox["consumed_at"] = utc_now()
         mailbox["updated_at"] = utc_now()
         atomic_write_json(path, mailbox)
+        message = mailbox.get("message") or {}
+        append_history(
+            bus_dir,
+            "consumed",
+            {
+                "role": role,
+                "message_id": message.get("message_id"),
+                "task_id": message.get("task_id"),
+                "type": message.get("type"),
+            },
+        )
     return mailbox
 
 
@@ -683,6 +728,40 @@ def cmd_takeover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_history(args: argparse.Namespace) -> int:
+    bus_dir = Path(args.dir)
+    ensure_bus(bus_dir)
+    records: List[Dict[str, Any]] = []
+    try:
+        with history_path(bus_dir).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # a torn concurrent append must not hide the rest
+                if not isinstance(record, dict):
+                    continue
+                message = record.get("message") or {}
+                task_id = record.get("task_id") or message.get("task_id")
+                msg_type = record.get("type") or message.get("type")
+                if args.task_id and task_id != args.task_id:
+                    continue
+                if args.type and msg_type != args.type:
+                    continue
+                if args.event and record.get("event") != args.event:
+                    continue
+                records.append(record)
+    except FileNotFoundError:
+        pass
+    if args.limit > 0:
+        records = records[-args.limit :]
+    print(json.dumps({"count": len(records), "records": records}, indent=2))
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     bus_dir = Path(args.dir)
     ensure_bus(bus_dir)
@@ -723,6 +802,198 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """End-to-end verification of this machine: real subprocesses, real notify chain."""
+    tool = str(Path(__file__).resolve())
+    work = Path(tempfile.mkdtemp(prefix="delegation-selftest-"))
+    bus = str(work / "bus")
+    checks: List[Tuple[str, bool, str]] = []
+
+    def run_cli(*cli: str, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, tool, *cli],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        checks.append((name, ok, detail))
+
+    def wait_listening(role: str, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            record = read_json(pid_path(Path(bus), role), idle_pid_record(role))
+            if record.get("state") == "listening":
+                return True
+            time.sleep(0.1)
+        return False
+
+    def wait_not_pending(role: str, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            mailbox = read_json(message_path(Path(bus), role), empty_mailbox(role))
+            if not mailbox_pending(mailbox):
+                return True
+            time.sleep(0.1)
+        return False
+
+    try:
+        result = run_cli("init", "--dir", bus)
+        check("init", result.returncode == 0, result.stderr)
+
+        result = run_cli(
+            "send", "--dir", bus, "--from-role", "delegator", "--type", "assignment",
+            "--task-id", "T1", "--subject", "s", "--body", "b",
+        )
+        check(
+            "send without listener",
+            result.returncode == 0 and "no-active-listener" in result.stdout,
+            result.stdout + result.stderr,
+        )
+        result = run_cli("receive", "--dir", bus, "--role", "delegatee")
+        check("receive consumes", result.returncode == 0, result.stderr)
+
+        waiter = subprocess.Popen(
+            [sys.executable, tool, "wait", "--dir", bus, "--role", "delegatee",
+             "--timeout", "60"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        registered = wait_listening("delegatee")
+        result = run_cli(
+            "send", "--dir", bus, "--from-role", "delegator", "--type", "response",
+            "--task-id", "T1", "--subject", "s2", "--body", "b2",
+        )
+        out, err = waiter.communicate(timeout=90)
+        check(
+            "wait woken by notify",
+            registered
+            and waiter.returncode == 0
+            and '"notified": true' in result.stdout
+            and ("listener-terminated" in out or "message-arrived-during-registration" in out),
+            out + err + result.stdout,
+        )
+
+        result = run_cli("wait", "--dir", bus, "--role", "delegator", "--timeout", "1")
+        check("wait timeout exits 4", result.returncode == 4, result.stdout)
+
+        run_cli(
+            "send", "--dir", bus, "--from-role", "delegator", "--type", "question",
+            "--task-id", "T1", "--subject", "q", "--body", "q",
+        )
+        result = run_cli(
+            "send", "--dir", bus, "--from-role", "delegator", "--type", "question",
+            "--task-id", "T1", "--subject", "q2", "--body", "q2",
+        )
+        check("double send refused", result.returncode != 0, result.stdout)
+        run_cli("receive", "--dir", bus, "--role", "delegatee")
+
+        awaiter = subprocess.Popen(
+            [sys.executable, tool, "await-reply", "--dir", bus, "--role", "delegator",
+             "--task-id", "T1", "--expect", "ack", "--timeout", "60"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        wait_listening("delegator")
+        run_cli(
+            "send", "--dir", bus, "--from-role", "delegatee", "--type", "progress",
+            "--task-id", "T1", "--subject", "p", "--body", "p",
+        )
+        wait_not_pending("delegator")
+        wait_listening("delegator")
+        run_cli(
+            "send", "--dir", bus, "--from-role", "delegatee", "--type", "ack",
+            "--task-id", "T1", "--subject", "a", "--body", "a",
+        )
+        out, err = awaiter.communicate(timeout=90)
+        check(
+            "await-reply with interim progress",
+            awaiter.returncode == 0
+            and '"reply-received"' in out
+            and '"type": "progress"' in out,
+            out + err,
+        )
+
+        result = run_cli(
+            "await-reply", "--dir", bus, "--role", "delegator", "--task-id", "T1",
+            "--expect", "result", "--timeout", "2",
+        )
+        check("await-reply timeout exits 4", result.returncode == 4, result.stdout)
+
+        awaiter = subprocess.Popen(
+            [sys.executable, tool, "await-reply", "--dir", bus, "--role", "delegator",
+             "--task-id", "T1", "--expect", "result", "--timeout", "60"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        wait_listening("delegator")
+        run_cli(
+            "send", "--dir", bus, "--from-role", "delegatee", "--type", "error",
+            "--task-id", "T1", "--subject", "e", "--body", "e",
+        )
+        out, err = awaiter.communicate(timeout=90)
+        check("await-reply unexpected exits 6", awaiter.returncode == 6, out + err)
+
+        run_cli(
+            "send", "--dir", bus, "--from-role", "delegatee", "--type", "result",
+            "--task-id", "T1", "--subject", "r", "--body", "r",
+        )
+        result = run_cli(
+            "takeover", "--dir", bus, "--role", "delegator", "--task-id", "T1",
+            "--reason", "deadline missed",
+        )
+        check("takeover refused on late reply", result.returncode == 7, result.stdout)
+        run_cli("receive", "--dir", bus, "--role", "delegator")
+
+        run_cli(
+            "send", "--dir", bus, "--from-role", "delegator", "--type", "assignment",
+            "--task-id", "T2", "--subject", "s", "--body", "b",
+        )
+        result = run_cli(
+            "takeover", "--dir", bus, "--role", "delegator", "--task-id", "T2",
+            "--reason", "no ack",
+        )
+        peer = run_cli("receive", "--dir", bus, "--role", "delegatee")
+        check(
+            "takeover replaces pending assignment",
+            result.returncode == 0 and '"type": "takeover"' in peer.stdout,
+            result.stdout + peer.stdout,
+        )
+
+        result = run_cli("history", "--dir", bus, "--task-id", "T1")
+        check(
+            "history records task",
+            result.returncode == 0 and '"sent"' in result.stdout,
+            result.stdout,
+        )
+
+        result = run_cli("reset", "--dir", bus)
+        check("reset", result.returncode == 0, result.stderr)
+        result = run_cli("receive", "--dir", bus, "--role", "delegator")
+        check("receive after reset exits 3", result.returncode == 3, result.stdout)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    failed = [name for name, ok, _ in checks if not ok]
+    report = {
+        "ok": not failed,
+        "platform": sys.platform,
+        "python": sys.version.split()[0],
+        "passed": len(checks) - len(failed),
+        "failed": len(failed),
+        "checks": [
+            {"name": name, "ok": ok, **({"detail": detail[-800:]} if not ok else {})}
+            for name, ok, detail in checks
+        ],
+    }
+    print(json.dumps(report, indent=2))
+    return 0 if not failed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -737,7 +1008,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--to-role", choices=ROLES)
     p_send.add_argument("--type", required=True, choices=MESSAGE_TYPES)
     p_send.add_argument("--subject", required=True)
-    p_send.add_argument("--body", required=True)
+    p_send.add_argument("--body")
+    p_send.add_argument(
+        "--body-file",
+        help="Read the body from a UTF-8 file; use - for stdin. Alternative to --body.",
+    )
     p_send.add_argument("--task-id")
     p_send.add_argument("--reply-to")
     p_send.add_argument("--metadata", help="JSON object")
@@ -799,6 +1074,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show mailboxes and listener liveness")
     p_status.add_argument("--dir", default=".delegation")
     p_status.set_defaults(func=cmd_status)
+
+    p_history = sub.add_parser("history", help="Show the append-only sent/consumed audit trail")
+    p_history.add_argument("--dir", default=".delegation")
+    p_history.add_argument("--task-id", help="Only records for this task")
+    p_history.add_argument("--type", choices=MESSAGE_TYPES, help="Only this message type")
+    p_history.add_argument("--event", choices=("sent", "consumed"), help="Only this event")
+    p_history.add_argument("--limit", type=int, default=20, help="Last N records; 0 for all")
+    p_history.set_defaults(func=cmd_history)
+
+    p_selftest = sub.add_parser(
+        "selftest", help="Run the end-to-end protocol test in a temporary directory"
+    )
+    p_selftest.set_defaults(func=cmd_selftest)
 
     p_reset = sub.add_parser("reset", help="Stop listeners and clear protocol state")
     p_reset.add_argument("--dir", default=".delegation")

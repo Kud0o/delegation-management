@@ -69,6 +69,12 @@ BUS_DIR=".delegation"
 python "$BUS_TOOL" init --dir "$BUS_DIR"
 ```
 
+Verify the machine once before first use; it runs the whole protocol end-to-end in a temporary directory and must print `"ok": true`:
+
+```bash
+python "$BUS_TOOL" selftest
+```
+
 On Windows PowerShell the same commands work with PowerShell variable syntax:
 
 ```powershell
@@ -87,6 +93,8 @@ python "$BUS_TOOL" send \
   --subject "Implement bounded change" \
   --body "Deliverable, scope, constraints, and acceptance checks."
 ```
+
+For long or multi-line bodies, write the body to a file and use `--body-file <path>` (or `--body-file -` to read stdin) instead of `--body`.
 
 Wait as delegatee. The command creates a disposable child, publishes its PID, waits for the peer to terminate it, reads the inbox, and marks the message consumed. With no explicit timeout, a delegatee waiter runs for **10 minutes (600 seconds)**:
 
@@ -150,6 +158,14 @@ Inspect all state:
 ```bash
 python "$BUS_TOOL" status --dir "$BUS_DIR"
 ```
+
+Review the append-only audit trail (every sent and consumed message survives mailbox overwrites in `history.jsonl`):
+
+```bash
+python "$BUS_TOOL" history --dir "$BUS_DIR" --task-id TASK-001
+```
+
+Filters: `--type`, `--event sent|consumed`, `--limit N` (0 for all). Use this to reconstruct a delegation session or audit what a silent peer last saw.
 
 Reset stale state only when no valid message needs preservation:
 

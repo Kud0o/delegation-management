@@ -1,0 +1,4 @@
+.delegation/
+__pycache__/
+*.pyc
+.ai-usage/
