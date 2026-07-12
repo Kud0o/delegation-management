@@ -1,6 +1,8 @@
 ---
 name: delegate
-description: Delegate tasks between exactly two local coding agents — a delegator and a delegatee — through file-based mailboxes with process-kill wake notifications. Use when asked to delegate work to another agent, hand off a task, act as delegator or delegatee, wait for delegated work or replies, exchange progress, questions, or results between two agents, or take over from a silent peer. Two trusted agents sharing one filesystem only; not for three or more agents, untrusted users, or remote machines.
+description: Coordinate exactly two local coding agents — a delegator that assigns work and a delegatee that executes it — through file-based mailboxes with instant wake notifications. Run /delegate delegator in one session and /delegate delegatee in another, both in the same project directory. Two trusted agents on one machine only.
+argument-hint: "[delegator|delegatee]"
+disable-model-invocation: true
 ---
 
 # Delegate
@@ -9,12 +11,14 @@ Coordinate two agents with explicit roles and a deterministic local protocol. Th
 
 ## Pick your role, read only its playbook
 
-| You are | Signal | Read now |
-|---------|--------|----------|
-| **Delegator** — you assign work | "/delegate delegator", "delegate this", "hand off X", "assign X to the other agent" | `references/delegator.md` |
-| **Delegatee** — you receive work | "/delegate delegatee", "wait for delegated work", "be the delegatee", "listen for tasks" | `references/delegatee.md` |
+This skill is invoked explicitly: `/delegate delegator` or `/delegate delegatee`.
 
-Read exactly one playbook; do not load both. "The other agent is silent" / "check on the delegated task" → you are the delegator.
+| Argument | You are | Read now |
+|----------|---------|----------|
+| `delegator` | You assign work, answer questions, review results | `references/delegator.md` |
+| `delegatee` | You receive work and execute it in scope | `references/delegatee.md` |
+
+Read exactly one playbook; do not load both. No argument given? Infer the role from the user's request (assigning work → delegator; waiting for work → delegatee) and confirm it in one line before starting.
 
 ## Setup (both roles)
 

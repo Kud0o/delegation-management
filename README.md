@@ -52,7 +52,7 @@ Open **two agent sessions in the same project directory** and give each one a ro
 
 > /delegate delegatee — wait for tasks from the other agent and do them.
 
-That's all. Plain phrases work too ("delegate this to the other agent", "wait for delegated work"). If something looks stuck, ask either agent to check — it reads the mailbox state and audit trail and tells you what happened.
+That's all. The skill triggers **only** on explicit `/delegate` invocation — it never auto-loads from prompt text, so it costs nothing and interferes with nothing until you call it. If something looks stuck, ask either agent to check — it reads the mailbox state and audit trail and tells you what happened.
 
 ## The flow
 
