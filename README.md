@@ -2,22 +2,41 @@
 
 **Let two coding agents work together on one machine — one assigns the work, the other does it.**
 
-`delegate` is a [Claude Code](https://claude.com/claude-code) / Agent SDK skill. You give each agent a role in one chat line; the agents handle everything else themselves — assignments, acknowledgements, questions, progress, results, and recovery when one side goes silent.
+`delegate` is an agent skill for any AI coding agent that can run shell commands — Claude Code, Cursor, Codex CLI, a custom Agent SDK loop, or two different agents entirely. You give each agent a role; the agents handle the rest themselves.
 
-No server, no broker, no dependencies: the agents coordinate through JSON files in a shared `.delegation/` directory, with an instant process-based wake-up. Works on Linux, macOS, and Windows.
+- The **delegator** owns the objective: it assigns tasks, answers questions, and reviews results.
+- The **delegatee** executes each task inside the scope it was given.
+
+No server, no broker, no dependencies: the agents coordinate through JSON files in a shared `.delegation/` directory, with an instant process-based wake-up (one stdlib-only Python file). Works on Linux, macOS, and Windows.
+
+```
+Delegator agent                        Delegatee agent
+   |                                        |
+   |  1. writes assignment  ──────────►  delegatee.message.json
+   |  2. wakes the delegatee ──────────►  (reacts instantly, no polling)
+   |                                        |
+   |  4. wakes, reads result            3. works, writes result
+ delegator.message.json  ◄──────────────  |
+```
+
+The message file is always authoritative; the wake signal is just speed. A missed notification loses nothing.
 
 ## Install
+
+For Claude Code:
 
 ```bash
 git clone https://github.com/Kud0o/delegation-management.git
 cp -r delegation-management ~/.claude/skills/delegate
 ```
 
-Optionally verify the machine once (or ask an agent to): `python ~/.claude/skills/delegate/scripts/delegation_bus.py selftest` must end with `"ok": true`.
+For any other agent: clone it anywhere and tell the agent to read `SKILL.md` — that file routes it to its role instructions.
+
+Optionally verify the machine once (or ask an agent to): `python scripts/delegation_bus.py selftest` must end with `"ok": true`.
 
 ## Use
 
-Open **two Claude Code sessions in the same project directory** and type one line into each:
+Open **two agent sessions in the same project directory** and give each one a role:
 
 **Session A:**
 
@@ -27,19 +46,51 @@ Open **two Claude Code sessions in the same project directory** and type one lin
 
 > /delegate delegatee — wait for tasks from the other agent and do them.
 
-That's all. Plain phrases work too ("delegate this to the other agent", "wait for delegated work").
+That's all. Plain phrases work too ("delegate this to the other agent", "wait for delegated work"). If something looks stuck, ask either agent to check — it reads the mailbox state and audit trail and tells you what happened.
 
-If something looks stuck, ask either agent to check — it will read the mailbox state and the audit trail (`status`, `history`) and tell you what happened.
+## The flow
 
-## How it works, in one paragraph
+What the two agents do between your two chat lines and the finished task:
 
-The delegator writes a task file into the delegatee's mailbox, then terminates a small disposable listener process the delegatee left behind — that termination is the instant wake-up call (the agent itself is never touched). The file is authoritative, the signal is just speed: a missed notification loses nothing. One message per direction at a time, explicit acknowledgements, finite deadlines, and a safe takeover procedure when a peer goes silent.
+1. **Assign.** The delegator announces itself, then sends an `assignment` with a task ID, concrete deliverable, allowed scope, and acceptance checks — and waits for the acknowledgement in the same call (`request --expect ack`).
+2. **Verify & accept.** The delegatee first checks a delegator actually exists (`wait --require-peer` — fails fast instead of waiting forever), then blocks until the assignment arrives and replies with an `ack` restating scope and assumptions, *before touching any file*. Misunderstandings surface here, not in the result.
+3. **Work.** The delegatee stays inside the assigned scope. Blocked on a decision that changes correctness? It sends a `question` and blocks on the `response` — the delegator answers with the decision. Long tasks emit `progress` at milestones; these pass through the delegator's wait automatically without ending it.
+4. **Deliver.** The delegatee sends a `result`: outcome, changed files, checks run, limitations. It doesn't need to wait around afterwards — the result stays durable until the delegator consumes it, even if the delegator is rate-limited at that moment.
+5. **Review.** The delegator validates the result against the acceptance checks, then integrates it or sends a corrective assignment under the same task ID. The whole exchange is replayable afterwards from the append-only audit trail (`history --task-id ...`).
 
-## Want the details?
+**One message per direction at a time.** A sender may not overwrite an unconsumed message, so nothing is ever lost mid-conversation.
 
-You only need them if you're debugging the bus or extending it — the agents read these themselves:
+### When one agent goes silent
 
-- [`SKILL.md`](SKILL.md) — role routing, command reference, rules
+A missed deadline never proves what happened — rate limit, crash, or just slow work — so recovery is explicit:
+
+1. The waiting agent's deadline expires (all waits are finite by default: 5 min for a delegator, 10 min for a delegatee).
+2. The delegator runs `takeover`, which first makes a final check for a late reply. If one is already sitting in its inbox, the takeover is **refused** — evaluate the reply instead.
+3. Otherwise a durable `takeover` message replaces whatever is unconsumed in the peer's inbox. If the silent agent ever resumes, it reads that first, stops immediately, and never publishes late changes.
+4. A delegatee whose *delegator* went silent follows the fallback declared in the assignment: continue within a pre-authorized safe default, or pause and leave a durable `result`/`error`.
+
+## Commands at a glance
+
+These are run by the agents; you'll mostly see them in the transcript.
+
+| Command | Purpose |
+|---------|---------|
+| `init --role R` | Create the protocol files, announce presence |
+| `send` / `receive` | Deliver one message / read the inbox now |
+| `request` | Send and wait for the reply in one call |
+| `wait` | Block until a message arrives (`--require-peer` = fail fast if the peer never ran) |
+| `await-reply --expect T` | Wait for a specific reply type on a task |
+| `takeover` | Reclaim ownership after a missed deadline |
+| `peers` / `status` / `history` | Who's here · full state · audit trail |
+| `reset` / `selftest` | Clear state · verify the machine (18 checks) |
+
+Message types: `assignment` `ack` `progress` `question` `response` `result` `cancel` `error` `heartbeat` `takeover`.
+
+## Details
+
+Only needed when debugging or extending the bus — the agents read these themselves:
+
+- [`SKILL.md`](SKILL.md) — role routing, full command reference, rules
 - [`references/delegator.md`](references/delegator.md) / [`references/delegatee.md`](references/delegatee.md) — per-role playbooks
 - [`references/protocol.md`](references/protocol.md) — wire format, state transitions, exit codes, platform notes
 
