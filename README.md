@@ -7,7 +7,9 @@
 - the **delegator** owns the objective, assigns tasks, and integrates the results;
 - the **delegatee** executes each task inside the scope it was given.
 
-They communicate through plain JSON files in a shared `.delegation/` directory, with a process-based wake-up trick so a waiting agent reacts instantly instead of polling. No server, no broker, no dependencies — one Python file.
+**You never type the commands in this README.** You give each agent a role in plain English (or with `/delegate`), describe the task, and the agents run everything below on their own. The Python CLI is the machinery *they* use — it is documented here so you can see how it works and audit what they did.
+
+Under the hood the agents communicate through plain JSON files in a shared `.delegation/` directory, with a process-based wake-up trick so a waiting agent reacts instantly instead of polling. No server, no broker, no dependencies — one Python file.
 
 ```
 Delegator agent                        Delegatee agent
@@ -30,27 +32,34 @@ git clone https://github.com/Kud0o/delegation-management.git
 cp -r delegation-management ~/.claude/skills/delegate
 ```
 
-Then verify the machine once — 18 end-to-end checks in a temporary directory:
+Then verify the machine once — 18 end-to-end checks in a temporary directory. This is the **only command you ever run yourself** (and even this you can just ask an agent to do):
 
 ```bash
 python ~/.claude/skills/delegate/scripts/delegation_bus.py selftest
 # must end with "ok": true
 ```
 
-## Using it from chat
+## Quick start — this is all you do
 
-Open two Claude Code sessions in the same project directory and give each one a role:
+Open **two Claude Code sessions in the same project directory** and type one line into each:
 
-| You type | The agent becomes |
-|----------|-------------------|
-| `/delegate delegator` — or "delegate this task to the other agent" | Delegator |
-| `/delegate delegatee` — or "wait for delegated work" | Delegatee |
+**Session A (the delegator):**
 
-Each agent reads only its own playbook (`references/delegator.md` or `references/delegatee.md`), keeping its context small, and then drives the CLI below.
+> /delegate delegator — assign the other agent to add input validation to src/signup.py, then wait for its result and review it.
+
+**Session B (the delegatee):**
+
+> /delegate delegatee — wait for tasks from the other agent and do them.
+
+That's it. Agent A writes the assignment, agent B wakes up, acknowledges, works, asks questions if blocked, and delivers the result back to A — all through the protocol below, with no further input from you. Plain phrases work too ("delegate this to the other agent", "wait for delegated work"); `/delegate <role>` is just the most deterministic trigger.
+
+Each agent reads only its own playbook (`references/delegator.md` or `references/delegatee.md`), keeping its context small.
 
 ---
 
-## A complete session, step by step
+## Under the hood: what the agents run
+
+Everything in this section is executed **by the agents, not by you**. It is shown so you can understand the protocol and audit a session afterwards.
 
 Terminal A is the delegator, terminal B is the delegatee. Both use the same `--dir`.
 
