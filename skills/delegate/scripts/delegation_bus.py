@@ -61,6 +61,25 @@ IS_WINDOWS = os.name == "nt"
 ROLE_DEFAULT_TIMEOUT = {"delegatee": 600.0, "delegator": 300.0}
 
 
+def force_utf8_streams() -> None:
+    """Emit UTF-8 on stdout/stderr regardless of the platform locale.
+
+    Message files are always UTF-8, but on Windows a piped stdout defaults to
+    the ANSI code page (e.g. cp1252). Without this, printing a message that
+    contains any non-cp1252 character (emoji, CJK, ...) raises
+    UnicodeEncodeError and the command exits non-zero even though the message
+    file was written successfully. stdin is included so `--body-file -` reads a
+    UTF-8 body regardless of the console code page.
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1007,6 +1026,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         return subprocess.run(
             [sys.executable, tool, *cli],
             text=True,
+            encoding="utf-8",
             capture_output=True,
             timeout=timeout,
         )
@@ -1066,6 +1086,18 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         result = run_cli("receive", "--dir", bus, "--role", "delegatee")
         check("receive consumes", result.returncode == 0, result.stderr)
 
+        unicode_body = "Café ☕ 日本語 — ação, naïve, \U0001f680"
+        result = run_cli(
+            "send", "--dir", bus, "--from-role", "delegator", "--type", "assignment",
+            "--task-id", "U1", "--subject", "Résumé", "--body", unicode_body,
+        )
+        got = run_cli("receive", "--dir", bus, "--role", "delegatee")
+        check(
+            "non-ASCII body survives send and receive",
+            result.returncode == 0 and got.returncode == 0 and unicode_body in got.stdout,
+            result.stdout + result.stderr + got.stdout + got.stderr,
+        )
+
         result = run_cli(
             "wait", "--dir", bus, "--role", "delegatee", "--require-peer", "--timeout", "1"
         )
@@ -1087,6 +1119,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             [sys.executable, tool, "wait", "--dir", bus, "--role", "delegatee",
              "--timeout", "60"],
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1123,6 +1156,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             [sys.executable, tool, "await-reply", "--dir", bus, "--role", "delegator",
              "--task-id", "T1", "--expect", "ack", "--timeout", "60"],
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1151,6 +1185,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
              "--type", "question", "--task-id", "T3", "--subject", "q3", "--body", "q3",
              "--expect", "response", "--timeout", "60"],
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1180,6 +1215,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             [sys.executable, tool, "await-reply", "--dir", bus, "--role", "delegator",
              "--task-id", "T1", "--expect", "result", "--timeout", "60"],
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1397,6 +1433,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    force_utf8_streams()
     parser = build_parser()
     args = parser.parse_args()
     try:
