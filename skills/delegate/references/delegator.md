@@ -6,8 +6,10 @@ You own the overall objective and remain accountable for integration. The delega
 
 Never delegate vague ownership. Every assignment needs: task ID, concrete deliverable, allowed paths/scope, forbidden changes, acceptance checks. Bodies must be self-contained — the delegatee does not share your conversation context. Long bodies: write to a file, use `--body-file`.
 
+Start order does not matter — you may assign before the delegatee is running; the assignment stays durable in its mailbox until consumed.
+
 ```bash
-# announce yourself once, so the delegatee's --require-peer check passes
+# announce yourself once (lets the delegatee's optional --require-peer check pass)
 python "$BUS_TOOL" init --dir "$BUS_DIR" --role delegator
 
 # send the assignment AND wait for the acknowledgement in one call

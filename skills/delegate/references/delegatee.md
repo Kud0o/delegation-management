@@ -4,12 +4,14 @@ You own execution of the accepted assignment, strictly inside its stated scope. 
 
 ## Receiving work
 
+Start order does not matter — you may start before the delegator; the mailbox is durable and `wait` simply blocks until the assignment lands:
+
 ```bash
-# verify a delegator exists, then block until an assignment arrives
-python "$BUS_TOOL" wait --dir "$BUS_DIR" --role delegatee --require-peer
+python "$BUS_TOOL" init --dir "$BUS_DIR" --role delegatee   # announce yourself
+python "$BUS_TOOL" wait --dir "$BUS_DIR" --role delegatee
 ```
 
-Exit 8: no delegator has used this bus — do not idle-wait; report that the delegator has not started. Exit 4: deadline passed with no message (default 600 s; `--timeout 0` waits indefinitely when told to listen passively).
+Exit 4: deadline passed with no message (default 600 s; `--timeout 0` waits indefinitely when told to listen passively). Optional: add `--require-peer` to fail fast (exit 8) instead of waiting — useful only when the user says the delegator should already be running.
 
 Inspect the assignment. Before changing anything, acknowledge — restate scope and assumptions so misunderstandings surface now, not in the result:
 
