@@ -23,16 +23,22 @@ The message file is always authoritative; the wake signal is just speed. A misse
 
 ## Install
 
-For Claude Code:
+One command — auto-detects your installed agents (Claude Code, Cursor, Codex, OpenCode, and 70+ more) and installs to the ones you pick:
+
+```bash
+npx skills add Kud0o/delegation-management
+```
+
+Manual alternative:
 
 ```bash
 git clone https://github.com/Kud0o/delegation-management.git
-cp -r delegation-management ~/.claude/skills/delegate
+cp -r delegation-management/skills/delegate ~/.claude/skills/delegate
 ```
 
-For any other agent: clone it anywhere and tell the agent to read `SKILL.md` — that file routes it to its role instructions.
+For an agent without a skills directory: clone anywhere and tell the agent to read `skills/delegate/SKILL.md` — that file routes it to its role instructions.
 
-Optionally verify the machine once (or ask an agent to): `python scripts/delegation_bus.py selftest` must end with `"ok": true`.
+Optionally verify the machine once (or ask an agent to): `python ~/.claude/skills/delegate/scripts/delegation_bus.py selftest` must end with `"ok": true`.
 
 ## Use
 
@@ -90,9 +96,9 @@ Message types: `assignment` `ack` `progress` `question` `response` `result` `can
 
 Only needed when debugging or extending the bus — the agents read these themselves:
 
-- [`SKILL.md`](SKILL.md) — role routing, full command reference, rules
-- [`references/delegator.md`](references/delegator.md) / [`references/delegatee.md`](references/delegatee.md) — per-role playbooks
-- [`references/protocol.md`](references/protocol.md) — wire format, state transitions, exit codes, platform notes
+- [`SKILL.md`](skills/delegate/SKILL.md) — role routing, full command reference, rules
+- [`delegator.md`](skills/delegate/references/delegator.md) / [`delegatee.md`](skills/delegate/references/delegatee.md) — per-role playbooks
+- [`protocol.md`](skills/delegate/references/protocol.md) — wire format, state transitions, exit codes, platform notes
 
 Scope: exactly two trusted agents on one machine. For 3+ agents or remote machines, use a real broker instead.
 
