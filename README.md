@@ -13,10 +13,14 @@ A Claude Code / Agent SDK skill that coordinates exactly two local coding agents
 ## Layout
 
 ```
-SKILL.md                     skill entry point (roles, commands, policies)
+SKILL.md                     thin router: role table, shared commands, rules
 scripts/delegation_bus.py    zero-dependency Python 3.9+ helper CLI
-references/protocol.md       envelope schema, state transitions, exit codes
+references/delegator.md      delegator playbook (loaded only by that role)
+references/delegatee.md      delegatee playbook (loaded only by that role)
+references/protocol.md       wire format, transitions, exit codes (debug only)
 ```
+
+Progressive disclosure keeps agent context small: each agent reads SKILL.md plus only its own role playbook. Invoke explicitly with `/delegate delegator` or `/delegate delegatee`, or let chat phrases trigger it.
 
 ## Quick start
 
