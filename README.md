@@ -40,6 +40,16 @@ For an agent without a skills directory: clone anywhere and tell the agent to re
 
 Optionally verify the machine once (or ask an agent to): `python ~/.claude/skills/delegate/scripts/delegation_bus.py selftest` must end with `"ok": true`.
 
+## Update
+
+Pull the latest version of the skill:
+
+```bash
+npx skills update delegate
+```
+
+Omit the name to update every installed skill (`npx skills update`). To see what's installed use `npx skills list`, and to remove it `npx skills remove delegate`. If you installed manually, re-run the `git clone` and `cp` from above.
+
 ## Use
 
 Open **two agent sessions in the same project directory** and give each one a role:
