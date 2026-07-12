@@ -81,6 +81,76 @@ def history_path(bus_dir: Path) -> Path:
     return bus_dir / "history.jsonl"
 
 
+def presence_path(bus_dir: Path, role: str) -> Path:
+    return bus_dir / f"{role}.presence.json"
+
+
+def touch_presence(bus_dir: Path, role: str) -> None:
+    atomic_write_json(
+        presence_path(bus_dir, role),
+        {"role": role, "pid": os.getpid(), "updated_at": utc_now()},
+    )
+
+
+def read_presence(bus_dir: Path, role: str) -> Optional[Dict[str, Any]]:
+    try:
+        return read_json(presence_path(bus_dir, role))
+    except FileNotFoundError:
+        return None
+
+
+def presence_age_seconds(record: Dict[str, Any]) -> Optional[float]:
+    raw = record.get("updated_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        seen = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return round((datetime.now(timezone.utc) - seen).total_seconds(), 1)
+
+
+def emit(payload: Dict[str, Any], pretty: bool) -> None:
+    if pretty:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+
+
+def compact(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in payload.items() if v not in (None, [], {}, "")}
+
+
+def slim_message(message: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Token-lean projection: drop constants and empty fields, keep content."""
+    if not isinstance(message, dict):
+        return None
+    keep = ("message_id", "task_id", "type", "from", "subject", "body", "reply_to")
+    slim = {key: message[key] for key in keep if message.get(key) not in (None, "")}
+    if message.get("metadata"):
+        slim["metadata"] = message["metadata"]
+    return slim
+
+
+def require_peer_or_fail(bus_dir: Path, role: str, pretty: bool) -> int:
+    """Exit 8 when the peer role has never used this bus."""
+    peer = other_role(role)
+    record = read_presence(bus_dir, peer)
+    if record is None:
+        emit(
+            {
+                "ok": False,
+                "reason": "peer-not-present",
+                "peer": peer,
+                "hint": f"No {peer} has used this bus yet; start the {peer} first "
+                f"(e.g. `init --dir <dir> --role {peer}` or any {peer} command).",
+            },
+            pretty,
+        )
+        return 8
+    return 0
+
+
 def append_history(bus_dir: Path, event: str, payload: Dict[str, Any]) -> None:
     """Append one audit record. History is diagnostic: never fail delivery over it."""
     record: Dict[str, Any] = {"event": event, "at": utc_now()}
@@ -324,14 +394,18 @@ def resolve_timeout(raw: Optional[float], role: str, *, allow_indefinite: bool) 
 def cmd_init(args: argparse.Namespace) -> int:
     bus_dir = Path(args.dir)
     ensure_bus(bus_dir)
-    result = {
-        "ok": True,
-        "directory": str(bus_dir.resolve()),
-        "files": [
-            str(message_path(bus_dir, role)) for role in ROLES
-        ] + [str(pid_path(bus_dir, role)) for role in ROLES],
-    }
-    print(json.dumps(result, indent=2))
+    if args.role:
+        touch_presence(bus_dir, args.role)
+    emit(
+        compact(
+            {
+                "ok": True,
+                "directory": str(bus_dir.resolve()),
+                "announced": args.role,
+            }
+        ),
+        args.pretty,
+    )
     return 0
 
 
@@ -394,6 +468,7 @@ def deliver(
     }
     atomic_write_json(path, envelope)
     append_history(bus_dir, "sent", {"message": message})
+    touch_presence(bus_dir, sender)
     notification = notify_listener(bus_dir, recipient)
     return {"ok": True, "message": message, "notification": notification}
 
@@ -432,7 +507,17 @@ def cmd_send(args: argparse.Namespace) -> int:
         metadata=parse_metadata(args.metadata),
         force=args.force,
     )
-    print(json.dumps(result, indent=2))
+    emit(
+        compact(
+            {
+                "ok": True,
+                "sent": slim_message(result["message"]),
+                "notified": result["notification"].get("notified"),
+                "notify": result["notification"].get("reason"),
+            }
+        ),
+        args.pretty,
+    )
     return 0
 
 
@@ -461,8 +546,17 @@ def consume_mailbox(bus_dir: Path, role: str, *, mark_consumed: bool) -> Dict[st
 def cmd_receive(args: argparse.Namespace) -> int:
     bus_dir = Path(args.dir)
     ensure_bus(bus_dir)
+    touch_presence(bus_dir, args.role)
     mailbox = consume_mailbox(bus_dir, args.role, mark_consumed=not args.peek)
-    print(json.dumps(mailbox, indent=2))
+    emit(
+        compact(
+            {
+                "status": mailbox.get("status"),
+                "message": slim_message(mailbox.get("message")),
+            }
+        ),
+        args.pretty,
+    )
     return 0 if mailbox_pending(mailbox) or mailbox.get("status") == "consumed" else 3
 
 
@@ -592,11 +686,28 @@ def wait_for_message(
 def cmd_wait(args: argparse.Namespace) -> int:
     bus_dir = Path(args.dir)
     ensure_bus(bus_dir)
+    touch_presence(bus_dir, args.role)
+    if args.require_peer:
+        failed = require_peer_or_fail(bus_dir, args.role, args.pretty)
+        if failed:
+            return failed
     timeout = resolve_timeout(args.timeout, args.role, allow_indefinite=True)
     result = wait_for_message(
         bus_dir, args.role, timeout, args.poll_interval, peek=args.peek
     )
-    print(json.dumps(result, indent=2))
+    emit(
+        compact(
+            {
+                "wake": result["wake_reason"],
+                "delivered": result["delivered"],
+                "elapsed": result["elapsed_seconds"],
+                "message": slim_message(result["mailbox"].get("message"))
+                if result["delivered"]
+                else None,
+            }
+        ),
+        args.pretty,
+    )
     if result["delivered"]:
         return 0
     return 4 if result["wake_reason"] == "timeout" else 5
@@ -615,73 +726,120 @@ def parse_expect(raw: str) -> List[str]:
     return expected
 
 
-def cmd_await_reply(args: argparse.Namespace) -> int:
-    bus_dir = Path(args.dir)
-    ensure_bus(bus_dir)
-    timeout = resolve_timeout(args.timeout, args.role, allow_indefinite=False)
-    assert timeout is not None
-    expected = parse_expect(args.expect)
+def await_reply_core(
+    bus_dir: Path,
+    role: str,
+    task_id: Optional[str],
+    expected: List[str],
+    timeout: float,
+    poll_interval: float,
+) -> Tuple[int, Dict[str, Any]]:
     deadline = time.monotonic() + timeout
-    interim: List[Dict[str, Any]] = []
+    interim: List[Optional[Dict[str, Any]]] = []
 
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "reason": "timeout",
-                        "expected": expected,
-                        "task_id": args.task_id,
-                        "interim_messages": interim,
-                    },
-                    indent=2,
-                )
+            return 4, compact(
+                {
+                    "ok": False,
+                    "reason": "timeout",
+                    "expected": expected,
+                    "task_id": task_id,
+                    "interim": interim,
+                }
             )
-            return 4
 
-        result = wait_for_message(
-            bus_dir, args.role, remaining, args.poll_interval, peek=False
-        )
+        result = wait_for_message(bus_dir, role, remaining, poll_interval, peek=False)
         if not result["delivered"]:
             continue  # spurious wake or timeout; loop re-checks the deadline
         message = result["mailbox"].get("message") or {}
         msg_type = message.get("type")
-        task_matches = args.task_id is None or message.get("task_id") == args.task_id
+        task_matches = task_id is None or message.get("task_id") == task_id
 
         if task_matches and msg_type in expected:
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "reason": "reply-received",
-                        "message": message,
-                        "interim_messages": interim,
-                    },
-                    indent=2,
-                )
+            return 0, compact(
+                {
+                    "ok": True,
+                    "reason": "reply-received",
+                    "message": slim_message(message),
+                    "interim": interim,
+                }
             )
-            return 0
         if task_matches and msg_type in INTERIM_TYPES:
-            interim.append(message)
+            interim.append(slim_message(message))
             continue
         # Terminal mismatch: wrong task or a decision-changing type. The
         # message is already consumed; hand it to the caller to evaluate.
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "reason": "unexpected-message",
-                    "expected": expected,
-                    "task_id": args.task_id,
-                    "message": message,
-                    "interim_messages": interim,
-                },
-                indent=2,
-            )
+        return 6, compact(
+            {
+                "ok": False,
+                "reason": "unexpected-message",
+                "expected": expected,
+                "task_id": task_id,
+                "message": slim_message(message),
+                "interim": interim,
+            }
         )
-        return 6
+
+
+def cmd_await_reply(args: argparse.Namespace) -> int:
+    bus_dir = Path(args.dir)
+    ensure_bus(bus_dir)
+    touch_presence(bus_dir, args.role)
+    if args.require_peer:
+        failed = require_peer_or_fail(bus_dir, args.role, args.pretty)
+        if failed:
+            return failed
+    timeout = resolve_timeout(args.timeout, args.role, allow_indefinite=False)
+    assert timeout is not None
+    expected = parse_expect(args.expect)
+    code, payload = await_reply_core(
+        bus_dir, args.role, args.task_id, expected, timeout, args.poll_interval
+    )
+    emit(payload, args.pretty)
+    return code
+
+
+def cmd_request(args: argparse.Namespace) -> int:
+    """Send a message and await its reply in one invocation (one agent tool call)."""
+    bus_dir = Path(args.dir)
+    ensure_bus(bus_dir)
+    sender = args.from_role
+    if args.require_peer:
+        failed = require_peer_or_fail(bus_dir, sender, args.pretty)
+        if failed:
+            return failed
+    timeout = resolve_timeout(args.timeout, sender, allow_indefinite=False)
+    assert timeout is not None
+    expected = parse_expect(args.expect)
+    result = deliver(
+        bus_dir,
+        sender=sender,
+        recipient=other_role(sender),
+        msg_type=args.type,
+        subject=args.subject,
+        body=resolve_body(args),
+        task_id=args.task_id,
+        reply_to=args.reply_to,
+        metadata=parse_metadata(args.metadata),
+        force=args.force,
+    )
+    task_id = result["message"]["task_id"]
+    code, reply = await_reply_core(
+        bus_dir, sender, task_id, expected, timeout, args.poll_interval
+    )
+    emit(
+        compact(
+            {
+                "sent": slim_message(result["message"]),
+                "notified": result["notification"].get("notified"),
+                "reply": reply,
+            }
+        ),
+        args.pretty,
+    )
+    return code
 
 
 def cmd_takeover(args: argparse.Namespace) -> int:
@@ -692,20 +850,21 @@ def cmd_takeover(args: argparse.Namespace) -> int:
 
     # Final late-reply check: never take over past a same-task reply that is
     # already durable in our inbox.
+    touch_presence(bus_dir, role)
     mailbox = read_json(message_path(bus_dir, role), empty_mailbox(role))
     if mailbox_pending(mailbox):
         message = mailbox.get("message") or {}
         if args.task_id is None or message.get("task_id") == args.task_id:
-            print(
-                json.dumps(
+            emit(
+                compact(
                     {
                         "ok": False,
                         "reason": "late-reply-pending",
                         "hint": "Consume this message with `receive` and evaluate it instead of taking over.",
-                        "message": message,
-                    },
-                    indent=2,
-                )
+                        "message": slim_message(message),
+                    }
+                ),
+                args.pretty,
             )
             return 7
 
@@ -723,8 +882,17 @@ def cmd_takeover(args: argparse.Namespace) -> int:
         # that peer must see the revocation first when it resumes.
         force=True,
     )
-    result["reason"] = "takeover-sent"
-    print(json.dumps(result, indent=2))
+    emit(
+        compact(
+            {
+                "ok": True,
+                "reason": "takeover-sent",
+                "sent": slim_message(result["message"]),
+                "notified": result["notification"].get("notified"),
+            }
+        ),
+        args.pretty,
+    )
     return 0
 
 
@@ -773,8 +941,30 @@ def cmd_status(args: argparse.Namespace) -> int:
             "mailbox": read_json(message_path(bus_dir, role), empty_mailbox(role)),
             "listener": pid_record,
             "listener_alive": isinstance(pid, int) and pid_alive(pid),
+            "presence": read_presence(bus_dir, role),
         }
     print(json.dumps({"directory": str(bus_dir.resolve()), "roles": roles}, indent=2))
+    return 0
+
+
+def cmd_peers(args: argparse.Namespace) -> int:
+    """Who has used this bus, and how recently. Verifies the peer started first."""
+    bus_dir = Path(args.dir)
+    ensure_bus(bus_dir)
+    peers: Dict[str, Any] = {}
+    for role in ROLES:
+        record = read_presence(bus_dir, role)
+        if record is None:
+            peers[role] = None
+        else:
+            peers[role] = compact(
+                {
+                    "pid": record.get("pid"),
+                    "last_seen": record.get("updated_at"),
+                    "age_seconds": presence_age_seconds(record),
+                }
+            )
+    emit({"peers": peers}, args.pretty)
     return 0
 
 
@@ -798,6 +988,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
                 pass
         atomic_write_json(message_path(bus_dir, role), empty_mailbox(role))
         atomic_write_json(pid_path(bus_dir, role), idle_pid_record(role))
+        try:
+            presence_path(bus_dir, role).unlink()
+        except FileNotFoundError:
+            pass
     print(json.dumps({"ok": True, "reset": list(targets)}, indent=2))
     return 0
 
@@ -838,9 +1032,27 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             time.sleep(0.1)
         return False
 
+    def wait_pending(role: str, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            mailbox = read_json(message_path(Path(bus), role), empty_mailbox(role))
+            if mailbox_pending(mailbox):
+                return True
+            time.sleep(0.1)
+        return False
+
     try:
         result = run_cli("init", "--dir", bus)
         check("init", result.returncode == 0, result.stderr)
+
+        result = run_cli(
+            "wait", "--dir", bus, "--role", "delegatee", "--require-peer", "--timeout", "1"
+        )
+        check(
+            "require-peer exits 8 before delegator ran",
+            result.returncode == 8 and "peer-not-present" in result.stdout,
+            result.stdout,
+        )
 
         result = run_cli(
             "send", "--dir", bus, "--from-role", "delegator", "--type", "assignment",
@@ -853,6 +1065,23 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         )
         result = run_cli("receive", "--dir", bus, "--role", "delegatee")
         check("receive consumes", result.returncode == 0, result.stderr)
+
+        result = run_cli(
+            "wait", "--dir", bus, "--role", "delegatee", "--require-peer", "--timeout", "1"
+        )
+        check(
+            "require-peer passes after delegator ran",
+            result.returncode == 4,
+            result.stdout,
+        )
+        result = run_cli("peers", "--dir", bus)
+        check(
+            "peers shows both roles",
+            result.returncode == 0
+            and '"delegator":{"pid"' in result.stdout
+            and '"delegatee":{"pid"' in result.stdout,
+            result.stdout,
+        )
 
         waiter = subprocess.Popen(
             [sys.executable, tool, "wait", "--dir", bus, "--role", "delegatee",
@@ -871,7 +1100,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "wait woken by notify",
             registered
             and waiter.returncode == 0
-            and '"notified": true' in result.stdout
+            and '"notified":true' in result.stdout
             and ("listener-terminated" in out or "message-arrived-during-registration" in out),
             out + err + result.stdout,
         )
@@ -913,7 +1142,31 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "await-reply with interim progress",
             awaiter.returncode == 0
             and '"reply-received"' in out
-            and '"type": "progress"' in out,
+            and '"type":"progress"' in out,
+            out + err,
+        )
+
+        requester = subprocess.Popen(
+            [sys.executable, tool, "request", "--dir", bus, "--from-role", "delegator",
+             "--type", "question", "--task-id", "T3", "--subject", "q3", "--body", "q3",
+             "--expect", "response", "--timeout", "60"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        wait_pending("delegatee")
+        run_cli("receive", "--dir", bus, "--role", "delegatee")
+        wait_listening("delegator")
+        run_cli(
+            "send", "--dir", bus, "--from-role", "delegatee", "--type", "response",
+            "--task-id", "T3", "--subject", "a3", "--body", "a3",
+        )
+        out, err = requester.communicate(timeout=90)
+        check(
+            "request combines send and await-reply",
+            requester.returncode == 0
+            and '"reply-received"' in out
+            and '"type":"response"' in out,
             out + err,
         )
 
@@ -960,7 +1213,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         peer = run_cli("receive", "--dir", bus, "--role", "delegatee")
         check(
             "takeover replaces pending assignment",
-            result.returncode == 0 and '"type": "takeover"' in peer.stdout,
+            result.returncode == 0 and '"type":"takeover"' in peer.stdout,
             result.stdout + peer.stdout,
         )
 
@@ -998,12 +1251,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="Create the four persistent protocol files")
-    p_init.add_argument("--dir", default=".delegation")
+    def add_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--dir", default=".delegation")
+        p.add_argument("--pretty", action="store_true", help="Indented output (default is compact)")
+
+    p_init = sub.add_parser("init", help="Create the persistent protocol files")
+    add_common(p_init)
+    p_init.add_argument(
+        "--role", choices=ROLES, help="Announce this role's presence so the peer can verify it"
+    )
     p_init.set_defaults(func=cmd_init)
 
     p_send = sub.add_parser("send", help="Write the peer inbox and terminate its listener")
-    p_send.add_argument("--dir", default=".delegation")
+    add_common(p_send)
     p_send.add_argument("--from-role", required=True, choices=ROLES)
     p_send.add_argument("--to-role", choices=ROLES)
     p_send.add_argument("--type", required=True, choices=MESSAGE_TYPES)
@@ -1020,13 +1280,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.set_defaults(func=cmd_send)
 
     p_receive = sub.add_parser("receive", help="Read this role's inbox")
-    p_receive.add_argument("--dir", default=".delegation")
+    add_common(p_receive)
     p_receive.add_argument("--role", required=True, choices=ROLES)
     p_receive.add_argument("--peek", action="store_true", help="Do not mark pending message consumed")
     p_receive.set_defaults(func=cmd_receive)
 
     p_wait = sub.add_parser("wait", help="Wait until peer kills the disposable listener")
-    p_wait.add_argument("--dir", default=".delegation")
+    add_common(p_wait)
     p_wait.add_argument("--role", required=True, choices=ROLES)
     p_wait.add_argument(
         "--timeout",
@@ -1036,13 +1296,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_wait.add_argument("--poll-interval", type=float, default=0.1)
     p_wait.add_argument("--peek", action="store_true")
+    p_wait.add_argument(
+        "--require-peer",
+        action="store_true",
+        help="Exit 8 immediately when the peer role has never used this bus",
+    )
     p_wait.set_defaults(func=cmd_wait)
 
     p_await = sub.add_parser(
         "await-reply",
         help="Wait for a reply of an expected type for a task; exit 4 when none arrives in time",
     )
-    p_await.add_argument("--dir", default=".delegation")
+    add_common(p_await)
     p_await.add_argument("--role", required=True, choices=ROLES)
     p_await.add_argument("--task-id", help="Only messages with this task ID satisfy the wait")
     p_await.add_argument(
@@ -1057,13 +1322,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds. Omitted: 600 for delegatee, 300 for delegator. 0 is rejected.",
     )
     p_await.add_argument("--poll-interval", type=float, default=0.1)
+    p_await.add_argument("--require-peer", action="store_true")
     p_await.set_defaults(func=cmd_await_reply)
+
+    p_request = sub.add_parser(
+        "request",
+        help="send + await-reply in one call: deliver a message and wait for its reply",
+    )
+    add_common(p_request)
+    p_request.add_argument("--from-role", required=True, choices=ROLES)
+    p_request.add_argument("--type", required=True, choices=MESSAGE_TYPES)
+    p_request.add_argument("--subject", required=True)
+    p_request.add_argument("--body")
+    p_request.add_argument("--body-file")
+    p_request.add_argument("--task-id")
+    p_request.add_argument("--reply-to")
+    p_request.add_argument("--metadata")
+    p_request.add_argument("--force", action="store_true")
+    p_request.add_argument(
+        "--expect",
+        default="ack",
+        help="Comma-separated acceptable reply types (default: ack)",
+    )
+    p_request.add_argument("--timeout", type=float, default=None)
+    p_request.add_argument("--poll-interval", type=float, default=0.1)
+    p_request.add_argument("--require-peer", action="store_true")
+    p_request.set_defaults(func=cmd_request)
+
+    p_peers = sub.add_parser(
+        "peers", help="Show which roles have used this bus and how recently"
+    )
+    add_common(p_peers)
+    p_peers.set_defaults(func=cmd_peers)
 
     p_takeover = sub.add_parser(
         "takeover",
         help="After a missed deadline: final late-reply check, then send a takeover message",
     )
-    p_takeover.add_argument("--dir", default=".delegation")
+    add_common(p_takeover)
     p_takeover.add_argument("--role", required=True, choices=ROLES)
     p_takeover.add_argument("--task-id")
     p_takeover.add_argument("--subject")

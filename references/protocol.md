@@ -42,6 +42,14 @@ Mailbox states:
 
 The mailbox stays as an audit snapshot until the next message overwrites it.
 
+## Presence files
+
+`<role>.presence.json` records `{role, pid, updated_at}` and is touched by every role-bearing command (`init --role`, `send`, `receive`, `wait`, `await-reply`, `request`, `takeover`). It answers "has the peer ever run, and when was it last seen" — used by `peers` and by `--require-peer` (exit 8 when the peer file is missing). `reset` deletes it. Presence is advisory: it proves past activity, not current liveness.
+
+## Output modes
+
+Transaction commands (`send`, `receive`, `wait`, `await-reply`, `request`, `takeover`, `init`, `peers`) print compact single-line JSON with a token-lean message projection (`message_id`, `task_id`, `type`, `from`, `subject`, `body`, `reply_to`, non-empty `metadata`); constant envelope fields are omitted. `--pretty` switches to indented output. `status` and `history` always print full detail. The on-disk envelope always retains every field.
+
 ## History file
 
 `history.jsonl` in the bus directory is an append-only diagnostic trail: one JSON record per line, `{"event": "sent", "at": ..., "message": {...}}` on delivery and `{"event": "consumed", "at": ..., "role", "message_id", "task_id", "type"}` on consumption. It survives mailbox overwrites and resets. It is not part of delivery semantics: history append failures never fail a send, torn lines are skipped on read, and agents must not treat it as an inbox. Inspect with the `history` command.
@@ -116,8 +124,9 @@ Omitted `--timeout` uses role defaults: 600 seconds for `delegatee`, 300 seconds
 | 5 | `wait`: woke without a pending message (spurious wake) |
 | 6 | `await-reply`: terminal message did not match `--expect` (already consumed) |
 | 7 | `takeover`: refused because a same-task reply is already pending |
+| 8 | `--require-peer`: the peer role has never used this bus |
 
-`selftest` exits 0 when every end-to-end check passes, 1 otherwise.
+`selftest` exits 0 when every end-to-end check passes, 1 otherwise. `request` exits with its `await-reply` phase's code.
 
 ## Why the listener is disposable
 
