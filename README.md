@@ -1,62 +1,177 @@
 # delegate
 
-A Claude Code / Agent SDK skill that coordinates exactly two local coding agents — a **delegator** and a **delegatee** — through file-based mailboxes with process-kill wake notifications. Triggers from chat phrases like "delegate this to the other agent", "hand off this task", or "wait for delegated work".
+**Let two coding agents work together on one machine — one assigns the work, the other does it.**
 
-**Why Python?** It is the only zero-setup cross-platform option: preinstalled wherever coding agents run, single stdlib-only file (no pip install), and the standard library covers atomic file replacement, subprocess control, and the Windows process APIs (ctypes) that shell scripts cannot reach portably.
+`delegate` is a [Claude Code](https://claude.com/claude-code) / Agent SDK skill that coordinates exactly two local agents:
 
-## How it works
+- the **delegator** owns the objective, assigns tasks, and integrates the results;
+- the **delegatee** executes each task inside the scope it was given.
 
-- Each role has one inbox file (`<role>.message.json`) and one disposable listener PID record (`<role>.pid`) in a shared `.delegation/` directory.
-- A sender atomically writes the peer's inbox, then terminates the peer's disposable listener child. Listener death is the wake signal; the agent process is never touched.
-- The message file is authoritative; the wake signal is only an optimization. Works on Linux, macOS, and Windows.
-
-## Layout
+They communicate through plain JSON files in a shared `.delegation/` directory, with a process-based wake-up trick so a waiting agent reacts instantly instead of polling. No server, no broker, no dependencies — one Python file.
 
 ```
-SKILL.md                     thin router: role table, shared commands, rules
-scripts/delegation_bus.py    zero-dependency Python 3.9+ helper CLI
-references/delegator.md      delegator playbook (loaded only by that role)
-references/delegatee.md      delegatee playbook (loaded only by that role)
-references/protocol.md       wire format, transitions, exit codes (debug only)
+Delegator agent                        Delegatee agent
+   |                                        |
+   |  1. writes assignment  ──────────►  delegatee.message.json
+   |  2. kills wake listener ─────────►  (delegatee wakes instantly)
+   |                                        |
+   |  4. wakes, reads result            3. works, writes result
+ delegator.message.json  ◄──────────────  |
 ```
 
-Progressive disclosure keeps agent context small: each agent reads SKILL.md plus only its own role playbook. Invoke explicitly with `/delegate delegator` or `/delegate delegatee`, or let chat phrases trigger it.
+The message **file** is always authoritative; the wake signal is just an optimization. If a notification is ever missed, the message is still there. Works unchanged on **Linux, macOS, and Windows** (Python 3.9+, standard library only).
 
-## Quick start
+---
+
+## Installation
 
 ```bash
-python scripts/delegation_bus.py selftest    # verify this machine end-to-end (18 checks)
-
-# delegator: announce, then send assignment and wait for the ack in ONE call
-python scripts/delegation_bus.py init --dir .delegation --role delegator
-python scripts/delegation_bus.py request --dir .delegation --from-role delegator \
-  --type assignment --task-id TASK-001 --subject "Do X" --body "Scope, checks." --expect ack
-
-# delegatee: verify a delegator exists, then block until work arrives
-python scripts/delegation_bus.py wait --dir .delegation --role delegatee --require-peer
-
-# audit the whole session afterwards
-python scripts/delegation_bus.py history --dir .delegation --task-id TASK-001
+git clone https://github.com/Kud0o/delegation-management.git
+cp -r delegation-management ~/.claude/skills/delegate
 ```
 
-## Features
+Then verify the machine once — 18 end-to-end checks in a temporary directory:
 
-- Atomic, durable single-slot mailboxes; the wake signal (listener kill) is only an optimization.
-- **Token-lean by default**: compact single-line JSON output (~70% smaller than pretty envelopes); `--pretty` for humans.
-- **`request`**: send + await-reply in one invocation — one agent tool call per round trip instead of two.
-- `await-reply` with reply contracts: interim `progress`/`heartbeat` pass through, unexpected terminal messages and timeouts get distinct exit codes.
-- **Presence & handshake**: `init --role` announces you; `peers` shows who ran and when; `--require-peer` fails fast (exit 8) when the delegator/delegatee never started.
-- Safe `takeover` after missed deadlines with a built-in final late-reply check.
-- Append-only `history.jsonl` audit trail surviving mailbox overwrites (`history` command with task/type/event filters).
-- `--body-file` / stdin for long multi-line message bodies.
-- Built-in `selftest` (18 end-to-end checks) — no test framework, no dependencies, Python 3.9+ stdlib only.
+```bash
+python ~/.claude/skills/delegate/scripts/delegation_bus.py selftest
+# must end with "ok": true
+```
 
-See `SKILL.md` for the full protocol: acknowledgements, progress leases, blocking questions, results, cancellation, and safe takeover after missed deadlines.
+## Using it from chat
 
-## Install as a skill
+Open two Claude Code sessions in the same project directory and give each one a role:
 
-Copy this directory to `~/.claude/skills/delegate/`.
+| You type | The agent becomes |
+|----------|-------------------|
+| `/delegate delegator` — or "delegate this task to the other agent" | Delegator |
+| `/delegate delegatee` — or "wait for delegated work" | Delegatee |
 
-## Scope
+Each agent reads only its own playbook (`references/delegator.md` or `references/delegatee.md`), keeping its context small, and then drives the CLI below.
 
-Two trusted agents on one machine sharing a filesystem. Not for 3+ agents, untrusted users, or networked delivery — use a real broker for that.
+---
+
+## A complete session, step by step
+
+Terminal A is the delegator, terminal B is the delegatee. Both use the same `--dir`.
+
+**A — announce yourself and send an assignment, waiting for the acknowledgement in one call:**
+
+```bash
+python delegation_bus.py init --dir .delegation --role delegator
+
+python delegation_bus.py request --dir .delegation --from-role delegator \
+  --type assignment --task-id TASK-001 \
+  --subject "Add input validation" \
+  --body "Validate email format in src/signup.py. Scope: that file only. Done when: tests in tests/test_signup.py pass." \
+  --expect ack --timeout 300
+```
+
+**B — check that a delegator exists, then block until work arrives:**
+
+```bash
+python delegation_bus.py wait --dir .delegation --role delegatee --require-peer
+# → {"wake":"listener-terminated","delivered":true,"message":{"type":"assignment",...}}
+```
+
+**B — accept before touching anything:**
+
+```bash
+python delegation_bus.py send --dir .delegation --from-role delegatee --type ack \
+  --task-id TASK-001 --subject "Accepted" \
+  --body "Will edit src/signup.py only; validating with tests/test_signup.py."
+```
+
+At this point A's `request` returns with the ack. A now waits for the outcome:
+
+```bash
+python delegation_bus.py await-reply --dir .delegation --role delegator \
+  --task-id TASK-001 --expect result,error --timeout 900
+```
+
+**B — hit a blocker? Ask and wait for the answer in one call:**
+
+```bash
+python delegation_bus.py request --dir .delegation --from-role delegatee \
+  --type question --task-id TASK-001 --subject "Decision needed" \
+  --body "Reject plus-addressing (user+tag@x.com)? A: allow. B: reject." \
+  --expect response --timeout 600
+```
+
+(A answers with `send --type response --reply-to <message_id>`. Interim `progress` messages pass through A's `await-reply` automatically without ending it.)
+
+**B — deliver the result (long bodies go in a file):**
+
+```bash
+python delegation_bus.py send --dir .delegation --from-role delegatee --type result \
+  --task-id TASK-001 --subject "Done" --body-file result.md
+```
+
+**A — audit the whole exchange afterwards:**
+
+```bash
+python delegation_bus.py history --dir .delegation --task-id TASK-001 --pretty
+```
+
+### When the other agent goes silent
+
+A missed deadline never proves what happened (rate limit? crash? just slow?), so recovery is explicit and safe:
+
+```bash
+# await-reply exited 4 (timeout). Reclaim ownership:
+python delegation_bus.py takeover --dir .delegation --role delegator \
+  --task-id TASK-001 --reason "No result before deadline"
+```
+
+- Exit **7** — a late reply was already sitting in your inbox; the takeover is refused so you can `receive` and evaluate it instead.
+- Exit **0** — a durable `takeover` message now replaces anything unconsumed in the peer's inbox. If the silent agent ever resumes, it reads that first, stops, and never publishes late changes.
+
+---
+
+## Command reference
+
+| Command | What it does |
+|---------|--------------|
+| `init --role R` | Create the protocol files and announce your presence |
+| `send` | Deliver one message and wake the peer |
+| `request` | `send` + `await-reply` in a single call (default `--expect ack`) |
+| `wait --role R` | Block until a message arrives; `--require-peer` fails fast if the peer never ran |
+| `await-reply --expect T` | Wait for a specific reply type on a task |
+| `receive [--peek]` | Read the inbox right now, without blocking |
+| `takeover --reason ...` | Reclaim ownership after a missed deadline |
+| `peers` | Show who has used this bus and how recently |
+| `status` | Full dump: mailboxes, listeners, presence |
+| `history` | Append-only audit trail with `--task-id` / `--type` / `--event` filters |
+| `reset` | Stop listeners and clear all state |
+| `selftest` | Verify this machine end to end |
+
+**Message types:** `assignment` · `ack` · `progress` · `question` · `response` · `result` · `cancel` · `error` · `heartbeat` · `takeover`
+
+**Exit codes:** `0` ok · `3` empty inbox · `4` timeout · `5` spurious wake · `6` unexpected reply (already consumed — evaluate it) · `7` takeover refused, late reply pending · `8` peer never ran
+
+**Timeouts:** omitted `--timeout` defaults to 600 s for a waiting delegatee and 300 s for a waiting delegator. `wait --timeout 0` waits forever; `await-reply` and `request` reject 0 — a no-reply decision needs a real deadline.
+
+**Output:** compact single-line JSON by default to keep agent context small (~70 % smaller than pretty-printing); add `--pretty` when a human is reading.
+
+---
+
+## Design notes
+
+**Why files + process kill instead of sockets or a queue?** Two agents on one machine don't need infrastructure. An atomically-replaced JSON file gives durability and a natural single-slot handshake (a sender may not overwrite an unconsumed message). Killing a *disposable* listener child — never the agent itself — turns process termination into an instant, cross-platform wake-up. The `.pid` file stores a random token, and the sender verifies the process command line still carries it before signaling, so a recycled PID is never killed by mistake.
+
+**Why Python?** It is the only zero-setup option that works everywhere coding agents run: preinstalled, single stdlib-only file, and it can reach the Windows process APIs (via ctypes) that portable shell scripts cannot.
+
+**What this is not:** a message queue. No concurrent writers per inbox, no fan-out, no cross-host delivery, no untrusted users. For three or more agents or remote machines, use a real broker (Redis, NATS, RabbitMQ) or an orchestration platform.
+
+## Repository layout
+
+```
+SKILL.md                     skill entry point — thin router the agent reads first
+scripts/delegation_bus.py    the entire implementation (Python 3.9+, no deps)
+references/delegator.md      delegator playbook (loaded only by that role)
+references/delegatee.md      delegatee playbook (loaded only by that role)
+references/protocol.md       wire format, state machines, exit codes (debugging)
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
