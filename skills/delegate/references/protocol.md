@@ -125,6 +125,7 @@ Omitted `--timeout` uses role defaults: 600 seconds for `delegatee`, 300 seconds
 | 6 | `await-reply`: terminal message did not match `--expect` (already consumed) |
 | 7 | `takeover`: refused because a same-task reply is already pending |
 | 8 | `--require-peer`: the peer role has never used this bus |
+| 9 | `send` / `request`: refused because the recipient inbox still holds an unconsumed message (single-slot rule). Output carries `blocking_message`. Consume it or resend with `--force`. |
 
 `selftest` exits 0 when every end-to-end check passes, 1 otherwise. `request` exits with its `await-reply` phase's code.
 
@@ -138,6 +139,7 @@ Putting the agent or terminal PID in the file would make a normal notification t
 - Windows: liveness via `OpenProcess`/`GetExitCodeProcess` (never `os.kill(pid, 0)`, which would terminate the process), identity via `Get-CimInstance Win32_Process`, wake via `TerminateProcess` (`os.kill` with `SIGTERM`). The listener child dies hard without running handlers; it holds no state, so this is safe. The identity check adds one PowerShell invocation (~1-3 s) per notify; the message file is durable before it runs.
 - The listener child is started detached (`start_new_session` on POSIX, `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` on Windows) so terminating it never affects the agent's process group.
 - Encoding: message files are read and written as UTF-8 on every platform, and stdin/stdout/stderr are reconfigured to UTF-8 at startup. Without that, a piped stdout on Windows uses the ANSI code page (e.g. cp1252) and a message body containing emoji or CJK would raise `UnicodeEncodeError` — the file would still be written but the command would exit non-zero, misleading the caller into thinking delivery failed.
+- Concurrency: both agents legitimately touch the same pid/message files at the same instant. On Windows an atomic `os.replace` (or an open for read) can then fail transiently with a sharing violation (`WinError` 5/32/33). These operations retry with a short backoff so a concurrent peer never turns into a spurious failure; POSIX is unaffected.
 
 ## Delivery semantics
 

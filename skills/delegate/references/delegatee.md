@@ -46,6 +46,8 @@ python "$BUS_TOOL" send --dir "$BUS_DIR" --from-role delegatee --type result \
 
 On failure, send `error`: details, reproducibility, safe recovery suggestion.
 
+**Always check the exit code of your `send`.** Exit `9` (`reason: recipient-inbox-full`) means your `result`/`error` was **not** delivered — the delegator has not yet consumed its previous message, and the single-slot rule blocked the write. Do not assume it arrived. Options: wait for the delegator to consume it and resend, or, if what's blocking is now obsolete, resend with `--force` to replace it. The output's `blocking_message` shows what is sitting in the delegator inbox.
+
 ## Cancel and takeover
 
 On `cancel` or `takeover`: stop immediately, preserve useful partial work, revert only if the message says so, and never publish late changes. After a `takeover`, report partial state only when a new assignment arrives.

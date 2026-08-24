@@ -45,7 +45,9 @@ All commands print compact single-line JSON to keep context small; add `--pretty
 | `peers` | Who has used this bus and how recently |
 | `status` / `history` / `reset` / `selftest` | Inspect, audit, clear, verify |
 
-Exit codes: 0 ok, 3 empty inbox, 4 timeout, 5 spurious wake, 6 unexpected reply (already consumed — evaluate it), 7 takeover refused (late reply pending), 8 peer never ran.
+Exit codes: 0 ok, 3 empty inbox, 4 timeout, 5 spurious wake, 6 unexpected reply (already consumed — evaluate it), 7 takeover refused (late reply pending), 8 peer never ran, 9 send refused because the peer inbox is still full (consume it or resend with `--force`).
+
+Always check the exit code of `send`/`request`. Exit 9 means your message was **not** delivered — the peer has not consumed its previous message. Do not assume delivery; the output names the `blocking_message`.
 
 Message types: `assignment` `ack` `progress` `question` `response` `result` `cancel` `error` `heartbeat` `takeover`.
 

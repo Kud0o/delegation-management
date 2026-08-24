@@ -206,6 +206,36 @@ def idle_pid_record(role: str) -> Dict[str, Any]:
     }
 
 
+# Windows raises these when a file is briefly opened by another process while
+# we try to replace or read it: ACCESS_DENIED (5), SHARING_VIOLATION (32),
+# LOCK_VIOLATION (33). Both agents legitimately touch the same pid/message
+# files at the same moment, so these are transient, not real failures.
+_SHARING_WINERRORS = frozenset((5, 32, 33))
+_SHARING_RETRY_ATTEMPTS = 40
+_SHARING_RETRY_MAX_DELAY = 0.15
+
+
+def is_transient_sharing_error(exc: OSError) -> bool:
+    if not IS_WINDOWS:
+        return False
+    return getattr(exc, "winerror", None) in _SHARING_WINERRORS
+
+
+def retry_on_sharing_violation(operation: Any) -> Any:
+    """Run a filesystem operation, retrying transient Windows sharing violations."""
+    last: Optional[OSError] = None
+    for attempt in range(_SHARING_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except OSError as exc:
+            if not is_transient_sharing_error(exc):
+                raise
+            last = exc
+            time.sleep(min(0.005 * (attempt + 1), _SHARING_RETRY_MAX_DELAY))
+    assert last is not None
+    raise last
+
+
 def atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -215,7 +245,9 @@ def atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
+        # os.replace is atomic, but on Windows it fails if a peer has the
+        # destination open for reading at that instant; retry the brief window.
+        retry_on_sharing_violation(lambda: os.replace(tmp_name, path))
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -225,9 +257,13 @@ def atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
 
 
 def read_json(path: Path, fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    try:
+    def _open_and_load() -> Dict[str, Any]:
         with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+            return json.load(handle)
+
+    try:
+        # A peer's atomic replace can briefly deny the open on Windows; retry it.
+        data = retry_on_sharing_violation(_open_and_load)
         if not isinstance(data, dict):
             raise ValueError(f"Expected an object in {path}")
         return data
@@ -440,6 +476,19 @@ def parse_metadata(raw: Optional[str]) -> Dict[str, Any]:
     return value
 
 
+class InboxFull(Exception):
+    """The recipient inbox still holds an unconsumed message (single-slot rule).
+
+    Carried separately from ordinary errors so callers get a distinct exit code
+    (9) and the blocking message, instead of a generic failure the sender might
+    mistake for "delivered".
+    """
+
+    def __init__(self, blocking_message: Optional[Dict[str, Any]]) -> None:
+        super().__init__("recipient inbox contains an unconsumed message")
+        self.blocking_message = blocking_message
+
+
 def deliver(
     bus_dir: Path,
     *,
@@ -456,11 +505,7 @@ def deliver(
     path = message_path(bus_dir, recipient)
     current = read_json(path, empty_mailbox(recipient))
     if mailbox_pending(current) and not force:
-        old_id = current.get("message", {}).get("message_id")
-        raise SystemExit(
-            f"Recipient inbox contains unconsumed message {old_id}. "
-            "Wait for acknowledgement/consumption or use --force deliberately."
-        )
+        raise InboxFull(current.get("message"))
 
     message_id = str(uuid.uuid4())
     sequence = int(current.get("sequence", 0)) + 1
@@ -507,6 +552,23 @@ def resolve_body(args: argparse.Namespace) -> str:
     return args.body
 
 
+def emit_inbox_full(exc: InboxFull, pretty: bool) -> int:
+    """Report a refused delivery distinctly so the sender cannot mistake it for success."""
+    emit(
+        compact(
+            {
+                "ok": False,
+                "reason": "recipient-inbox-full",
+                "hint": "The peer has not consumed its previous message. It must `receive` "
+                "first, or resend with --force to deliberately replace an obsolete message.",
+                "blocking_message": slim_message(exc.blocking_message),
+            }
+        ),
+        pretty,
+    )
+    return 9
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     bus_dir = Path(args.dir)
     ensure_bus(bus_dir)
@@ -514,18 +576,21 @@ def cmd_send(args: argparse.Namespace) -> int:
     recipient = args.to_role or other_role(sender)
     if sender == recipient:
         raise SystemExit("Sender and recipient roles must differ")
-    result = deliver(
-        bus_dir,
-        sender=sender,
-        recipient=recipient,
-        msg_type=args.type,
-        subject=args.subject,
-        body=resolve_body(args),
-        task_id=args.task_id,
-        reply_to=args.reply_to,
-        metadata=parse_metadata(args.metadata),
-        force=args.force,
-    )
+    try:
+        result = deliver(
+            bus_dir,
+            sender=sender,
+            recipient=recipient,
+            msg_type=args.type,
+            subject=args.subject,
+            body=resolve_body(args),
+            task_id=args.task_id,
+            reply_to=args.reply_to,
+            metadata=parse_metadata(args.metadata),
+            force=args.force,
+        )
+    except InboxFull as exc:
+        return emit_inbox_full(exc, args.pretty)
     emit(
         compact(
             {
@@ -832,18 +897,21 @@ def cmd_request(args: argparse.Namespace) -> int:
     timeout = resolve_timeout(args.timeout, sender, allow_indefinite=False)
     assert timeout is not None
     expected = parse_expect(args.expect)
-    result = deliver(
-        bus_dir,
-        sender=sender,
-        recipient=other_role(sender),
-        msg_type=args.type,
-        subject=args.subject,
-        body=resolve_body(args),
-        task_id=args.task_id,
-        reply_to=args.reply_to,
-        metadata=parse_metadata(args.metadata),
-        force=args.force,
-    )
+    try:
+        result = deliver(
+            bus_dir,
+            sender=sender,
+            recipient=other_role(sender),
+            msg_type=args.type,
+            subject=args.subject,
+            body=resolve_body(args),
+            task_id=args.task_id,
+            reply_to=args.reply_to,
+            metadata=parse_metadata(args.metadata),
+            force=args.force,
+        )
+    except InboxFull as exc:
+        return emit_inbox_full(exc, args.pretty)
     task_id = result["message"]["task_id"]
     code, reply = await_reply_core(
         bus_dir, sender, task_id, expected, timeout, args.poll_interval
@@ -1149,7 +1217,11 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "send", "--dir", bus, "--from-role", "delegator", "--type", "question",
             "--task-id", "T1", "--subject", "q2", "--body", "q2",
         )
-        check("double send refused", result.returncode != 0, result.stdout)
+        check(
+            "double send refused with exit 9 + reason",
+            result.returncode == 9 and "recipient-inbox-full" in result.stdout,
+            str(result.returncode) + " " + result.stdout + result.stderr,
+        )
         run_cli("receive", "--dir", bus, "--role", "delegatee")
 
         awaiter = subprocess.Popen(
